@@ -44,7 +44,14 @@ docker compose logs -f app
 ### View MySQL logs
 
 ```bash
-docker compose logs -f mysql
+docker compose logs -f mysql1   # or mysql2 / mysql3 / router
+```
+
+### Check cluster status
+
+```bash
+docker compose exec mysql1 mysql -uroot -p"$(grep '^MYSQL_ROOT_PASSWORD' .env | cut -d= -f2)" \
+  -e "SELECT MEMBER_HOST, MEMBER_ROLE, MEMBER_STATE FROM performance_schema.replication_group_members;"
 ```
 
 ### Stop containers
@@ -112,13 +119,32 @@ Browser
    ▼
 Laravel container (app)
    │
-   │ MySQL :3306
+   │ MySQL :6446 (read/write) / :6447 (read-only)
    ▼
-MySQL container (mysql)
+MySQL Router container (router)
+   │
+   ├──> mysql1  (PRIMARY)
+   ├──> mysql2  (SECONDARY)
+   └──> mysql3  (SECONDARY)
 ```
 
-- **app**: Laravel application running on PHP 8.3 with built-in development server on port 8000
-- **mysql**: MySQL 8.0 database with persistent volume
+- **mysql1..3**: MySQL Server 8.0 nodes forming a single-primary **InnoDB Cluster** via Group Replication. Config: `database_cluster/innodb-cluster.cnf`.
+- **init-cluster**: one-shot job (built from `database_cluster/mysqlsh.Dockerfile`) that runs `database_cluster/init-cluster.py` with the MySQL Shell AdminAPI (Python mode): `dba.configure_instance()` on each node, `dba.create_cluster()` on mysql1, then `cluster.add_instance()` (clone recovery) for the secondaries. Safe to re-run.
+- **router**: MySQL Router, auto-bootstrapped against the cluster metadata; exposes RW `:6446` and RO `:6447`.
+- **app**: Laravel application (PHP 8.4-fpm) connecting to the router.
+
+Startup order is enforced by compose conditions: healthy servers -> init-cluster completes -> router bootstraps -> app starts (after waiting for router to accept connections).
+
+### Resetting the cluster
+
+The cluster topology lives in the `mysql*_data` volumes. To re-provision from scratch:
+
+```bash
+docker compose down -v
+docker compose up --build -d
+```
+
+**Note**: MySQL 8.0 is approaching end of life; plan an upgrade to MySQL 8.4 LTS (`mysql:8.4`, `mysql/mysql-router:8.4` and matching Shell) when convenient - the configs here are already compatible with it.
 
 ## Environment Variables
 
@@ -126,14 +152,15 @@ The following environment variables are configured via Docker Compose:
 
 ```env
 DB_CONNECTION=mysql
-DB_HOST=mysql
-DB_PORT=3306
+DB_HOST=router
+DB_PORT=6446
 DB_DATABASE=epoch_converter
 DB_USERNAME=epoch_user
 DB_PASSWORD=epoch_password
+MYSQL_ROOT_PASSWORD=root_password
 ```
 
-**Note**: The MySQL data persists in a named Docker volume (`mysql_data`). Running `docker compose down` will NOT remove the volume. To remove the volume and all data, use `docker compose down -v`.
+**Note**: The MySQL data persists in named Docker volumes (`mysql1_data`, `mysql2_data`, `mysql3_data`). Running `docker compose down` will NOT remove them. To remove the volumes and all data, use `docker compose down -v`.
 
 ## Development
 
