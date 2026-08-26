@@ -1,0 +1,12 @@
+[mysqld]
+# Node identity: mysql3
+
+server_id=103
+report_host=mysql3
+
+# Group Replication communication. loose- prefix required: see base.cnf.
+loose-group_replication_local_address=mysql3:33061
+loose-group_replication_group_seeds=mysql1:33061,mysql2:33061,mysql3:33061
+
+# Pin relay-log names so replication survives hostname changes (MY-010604)
+relay_log=mysql3-relay-bin

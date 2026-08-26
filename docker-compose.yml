@@ -1,150 +1,13 @@
-# InnoDB Cluster (single-primary) + MySQL Router + Laravel app.
+# InnoDB Cluster setup following the MySQL guide
+# https://dev.mysql.com/blog-archive/docker-compose-setup-for-innodb-cluster/
 #
-# Topology:
-#
-#   app ──> router :6446 (RW) ──> mysql1 (PRIMARY)
-#                             ├──> mysql2 (SECONDARY)
-#                             └──> mysql3 (SECONDARY)
-#   app ──> router :6447 (RO) ──> secondaries (for read scaling)
-#
-# Start:               docker compose up --build
-# Clean re-provision:  docker compose down -v && docker compose up --build
-#                      (-v wipes the mysql*_data volumes; the cluster is
-#                       bootstrapped from scratch by the init-cluster job)
-
-x-mysql-common: &mysql-common
-  image: mysql:8.0
-  restart: unless-stopped
-  networks:
-    - epoch-network
-  environment:
-    MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
-    MYSQL_DATABASE: ${DB_DATABASE:?set DB_DATABASE in .env}
-    MYSQL_USER: ${DB_USERNAME:?set DB_USERNAME in .env}
-    MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-  healthcheck:
-    # Real authenticated query over the Unix socket: fails while the
-    # entrypoint's temporary init server is running (root still has an empty
-    # password there) and passes once the fully-initialized server is ready.
-    # ($$ defers expansion to the container's shell.)
-    test: ["CMD-SHELL", "mysql --no-defaults -hlocalhost -uroot -p\"$$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1' >/dev/null 2>&1 || exit 1"]
-    interval: 5s
-    timeout: 5s
-    retries: 20
-    start_period: 60s
-
-services:
-  # --- MySQL Server nodes ---------------------------------------------------
-  # server-id differs per node; all other Group Replication prerequisites come
-  # from database_cluster/innodb-cluster.cnf mounted into each node.
-  mysql1:
-    <<: *mysql-common
-    container_name: mysql1
-    hostname: mysql1
-    command: ["mysqld", "--server-id=101"]
-    volumes:
-      - mysql1_data:/var/lib/mysql
-      - ./database_cluster/innodb-cluster.cnf:/etc/mysql/conf.d/innodb-cluster.cnf:ro
-
-  mysql2:
-    <<: *mysql-common
-    container_name: mysql2
-    hostname: mysql2
-    command: ["mysqld", "--server-id=102"]
-    # Stagger node boots: three parallel --initialize jobs can exhaust RAM on
-    # smaller dev machines. After the first run this adds only a tiny delay.
-    depends_on:
-      mysql1:
-        condition: service_healthy
-    volumes:
-      - mysql2_data:/var/lib/mysql
-      - ./database_cluster/innodb-cluster.cnf:/etc/mysql/conf.d/innodb-cluster.cnf:ro
-
-  mysql3:
-    <<: *mysql-common
-    container_name: mysql3
-    hostname: mysql3
-    command: ["mysqld", "--server-id=103"]
-    depends_on:
-      mysql2:
-        condition: service_healthy
-    volumes:
-      - mysql3_data:/var/lib/mysql
-      - ./database_cluster/innodb-cluster.cnf:/etc/mysql/conf.d/innodb-cluster.cnf:ro
-
-  # --- One-shot cluster provisioning ----------------------------------------
-  # Runs dba.configure_instance() on every node, then creates the cluster on
-  # mysql1 and joins mysql2/mysql3 with clone recovery. Idempotent.
-  # (Python mode because Ubuntu's mysql-shell has no JavaScript support.)
-  init-cluster:
-    build:
-      context: ./database_cluster
-      dockerfile: mysqlsh.Dockerfile
-    container_name: init-cluster
-    restart: "no"
-    networks:
-      - epoch-network
-    depends_on:
-      mysql1:
-        condition: service_healthy
-      mysql2:
-        condition: service_healthy
-      mysql3:
-        condition: service_healthy
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
-    volumes:
-      - ./database_cluster/init-cluster.py:/init-cluster.py:ro
-    command: ["--py", "--file", "/init-cluster.py"]
-
-  # --- MySQL Router ----------------------------------------------------------
-  # Bootstraps itself against the cluster metadata using the env vars below.
-  router:
-    image: mysql/mysql-router:8.0
-    container_name: mysql-router
-    restart: unless-stopped
-    networks:
-      - epoch-network
-    ports:
-      - "6446:6446" # classic protocol, read-write -> primary
-      - "6447:6447" # classic protocol, read-only  -> secondaries
-    environment:
-      MYSQL_HOST: mysql1
-      MYSQL_PORT: "3306"
-      MYSQL_USER: root
-      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
-      MYSQL_CREATE_ROUTER_USER: "1"
-    depends_on:
-      init-cluster:
-        condition: service_completed_successfully
-
-  # --- Laravel app ------------------------------------------------------------
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: epoch-converter-app
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      DB_HOST: router
-      DB_PORT: "6446"
-    volumes:
-      - .:/var/www/html
-    depends_on:
-      router:
-        condition: service_started
-    networks:
-      - epoch-network
-      - edge
-    command:
-      - bash
-      - -c
-      - |
-        echo "Waiting for MySQL Router to accept connections..."
-        until (echo > /dev/tcp/router/6446) 2>/dev/null; do sleep 1; done
-        exec php artisan serve --host=0.0.0.0 --port=8000
+# Topology (same as the guide):
+#   mysql1, mysql2, mysql3  - cluster members (mysql:8.0 includes both mysqld
+#                             and mysqlsh, so one image covers servers + shell)
+#   init-cluster            - temporary mysqlsh container that creates the
+#                             cluster and joins members, then exits
+#   router                  - bootstrapped against the cluster (RW 6446 / RO 6447)
+#   app                     - Laravel app connecting through router:6446
 
 networks:
   epoch-network:
@@ -157,3 +20,137 @@ volumes:
   mysql1_data:
   mysql2_data:
   mysql3_data:
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: epoch-converter-app
+    env_file:
+      - .env
+    volumes:
+      - .:/var/www/html
+    depends_on:
+      router:
+        condition: service_started
+    networks:
+      - epoch-network
+      - edge
+
+  # Shared config for all three nodes lives in database_cluster/base.cnf;
+  # per-node identity (server_id, report_host, GR addresses) in node{N}.cnf.
+  # No `command:` overrides on purpose: custom mysqld args are what broke
+  # first-boot initialization in previous attempts.
+  mysql1:
+    image: mysql:8.0
+    container_name: mysql1
+    hostname: mysql1
+    # Required for clone-based recovery: after cloning, mysqld restarts
+    # itself and needs a supervisor to bring it back up.
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_DATABASE}
+      MYSQL_USER: ${DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./database_cluster/base.cnf:/etc/mysql/conf.d/10-base.cnf:ro
+      - ./database_cluster/node1.cnf:/etc/mysql/conf.d/20-node.cnf:ro
+      - mysql1_data:/var/lib/mysql
+    healthcheck:
+      # mysqladmin ping exits 0 as soon as the server answers, even without
+      # credentials - no password needed here.
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      - epoch-network
+
+  mysql2:
+    image: mysql:8.0
+    container_name: mysql2
+    hostname: mysql2
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ./database_cluster/base.cnf:/etc/mysql/conf.d/10-base.cnf:ro
+      - ./database_cluster/node2.cnf:/etc/mysql/conf.d/20-node.cnf:ro
+      - mysql2_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      - epoch-network
+
+  mysql3:
+    image: mysql:8.0
+    container_name: mysql3
+    hostname: mysql3
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ./database_cluster/base.cnf:/etc/mysql/conf.d/10-base.cnf:ro
+      - ./database_cluster/node3.cnf:/etc/mysql/conf.d/20-node.cnf:ro
+      - mysql3_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      - epoch-network
+
+  init-cluster:
+    image: mysql:8.0
+    container_name: init-cluster
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ./database_cluster/init_cluster.js:/scripts/init_cluster.js:ro
+    depends_on:
+      mysql1:
+        condition: service_healthy
+      mysql2:
+        condition: service_healthy
+      mysql3:
+        condition: service_healthy
+    networks:
+      - epoch-network
+    restart: "no"
+    # The shell bundled in mysql:8.0 opens its startup session BEFORE reading
+    # the script; without an explicit --uri it dials the local socket (absent
+    # in this container) and dies with Error 2002 before any script code runs.
+    # MYSQLSH_*/MYSQL_PWD env vars are NOT honored here, so credentials go on
+    # the command line (dev-only setup).
+    entrypoint: ["mysqlsh", "--uri=root:${MYSQL_ROOT_PASSWORD}@mysql1:3306", "--js"]
+    command: ["-f", "/scripts/init_cluster.js"]
+
+  router:
+    image: mysql/mysql-router:8.0
+    container_name: mysql-router
+    environment:
+      MYSQL_HOST: mysql1
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_CREATE_ROUTER_USER: 1
+    ports:
+      - "6446:6446"
+      - "6447:6447"
+    restart: unless-stopped
+    depends_on:
+      init-cluster:
+        # Safety net: only bootstrap the router once init_cluster.js exited 0,
+        # i.e. against a fully provisioned cluster.
+        condition: service_completed_successfully
+    networks:
+      - epoch-network
