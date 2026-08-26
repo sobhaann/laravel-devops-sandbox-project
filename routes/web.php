@@ -8,3 +8,5 @@ Route::get('/', [ConversionController::class, 'index'])
 
 Route::post('/convert', [ConversionController::class, 'store'])
     ->name('conversions.store');
+
+Route::get('/convert', fn () => redirect()->route('conversions.index'));
