@@ -8,6 +8,12 @@
 #                             cluster and joins members, then exits
 #   router                  - bootstrapped against the cluster (RW 6446 / RO 6447)
 #   app                     - Laravel app connecting through router:6446
+#
+# NOTE: this file supersedes any older copies floating around (sandbox syncs).
+# Key invariants that MUST survive future edits:
+#   * no bind mount of the project into /var/www/html (shadows baked vendor/)
+#   * healthchecks probe TCP (-h 127.0.0.1), never the Unix socket
+#   * generous first-boot budget (slow VMs need minutes, not seconds)
 
 networks:
   epoch-network:
@@ -22,6 +28,10 @@ volumes:
   mysql3_data:
 
 services:
+  # Self-contained image: code AND vendor are baked at build time (Dockerfile).
+  # No bind mount on purpose - a host checkout without vendor/ must never be
+  # able to shadow the built dependencies. After code changes run:
+  #   docker compose up -d --build app
   app:
     build:
       context: .
@@ -29,8 +39,6 @@ services:
     container_name: epoch-converter-app
     env_file:
       - .env
-    volumes:
-      - .:/var/www/html
     depends_on:
       router:
         condition: service_started
@@ -59,13 +67,15 @@ services:
       - ./database_cluster/node1.cnf:/etc/mysql/conf.d/20-node.cnf:ro
       - mysql1_data:/var/lib/mysql
     healthcheck:
-      # mysqladmin ping exits 0 as soon as the server answers, even without
-      # credentials - no password needed here.
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      # IMPORTANT: -h 127.0.0.1 forces TCP. -h localhost would use the Unix
+      # socket, which the entrypoint's TEMPORARY server (first boot, TCP off)
+      # also answers - marking the node healthy before the real server exists
+      # and launching init-cluster into "connection refused".
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
       interval: 5s
       timeout: 5s
-      retries: 20
-      start_period: 60s
+      retries: 30
+      start_period: 300s
     networks:
       - epoch-network
 
@@ -81,11 +91,13 @@ services:
       - ./database_cluster/node2.cnf:/etc/mysql/conf.d/20-node.cnf:ro
       - mysql2_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      # TCP probe (-h 127.0.0.1): the entrypoint's temporary server (first
+      # boot, socket-only) must NOT satisfy this - see note on mysql1.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
       interval: 5s
       timeout: 5s
-      retries: 20
-      start_period: 60s
+      retries: 30
+      start_period: 300s
     networks:
       - epoch-network
 
@@ -101,11 +113,11 @@ services:
       - ./database_cluster/node3.cnf:/etc/mysql/conf.d/20-node.cnf:ro
       - mysql3_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
       interval: 5s
       timeout: 5s
-      retries: 20
-      start_period: 60s
+      retries: 30
+      start_period: 300s
     networks:
       - epoch-network
 

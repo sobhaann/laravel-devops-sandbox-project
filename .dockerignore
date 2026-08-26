@@ -1,0 +1,10 @@
+# Never bake host state into the image: dependencies come from composer.lock
+# (fresh install during build), secrets come from env_file at runtime.
+vendor
+node_modules
+.git
+.env
+storage/logs/*.log
+storage/framework/cache/data/*
+storage/framework/sessions/*
+storage/framework/views/*
