@@ -21,15 +21,25 @@ RUN docker-php-ext-install \
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
+RUN composer config -g repos.packagist composer \
+    https://package-mirror.liara.ir/repository/composer/
+
+
 WORKDIR /var/www/html
 
+# Copy ONLY the dependency manifests first. This layer — and the expensive
+# composer install after it — is now cached based purely on these two files,
+# not your entire repo. Editing docker-compose.yml, my.cnf, etc. no longer
+# touches this cache at all.
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader --no-scripts
+
+# Now bring in the rest of the app.
 COPY . .
 
-RUN composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader
-
-RUN chown -R www-data:www-data /var/www/html \
-    && chmod -R 755 /var/www/html/storage \
-    && chmod -R 755 /var/www/html/bootstrap/cache
+RUN composer dump-autoload --optimize \
+    && chown -R www-data:www-data storage bootstrap/cache \
+    && chmod -R ug+rwx storage bootstrap/cache
 
 EXPOSE 8000
 

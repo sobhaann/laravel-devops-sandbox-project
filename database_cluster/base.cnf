@@ -1,0 +1,41 @@
+[mysqld]
+# Shared InnoDB Cluster requirements (MySQL manual + docker-compose guide).
+# Loaded by every node via /etc/mysql/conf.d/10-base.cnf.
+
+# Only transactional storage engines may hold data in Group Replication.
+disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,CSV,ARCHIVE"
+
+# Replication / GTID requirements
+gtid_mode=ON
+enforce_gtid_consistency=ON
+log_bin=binlog
+log_replica_updates=ON
+binlog_checksum=NONE
+
+# AdminAPI rejects instances whose dependency tracking is left at the
+# default COMMIT_ORDER; WRITESET is required for Group Replication.
+# (Deprecated warning in the log is expected - still enforced by Shell 8.0.)
+binlog_transaction_dependency_tracking=WRITESET
+
+# Same choice as the MySQL guide: PHP PDO talks plain TCP without TLS, and
+# caching_sha2_password full authentication over plaintext connections dies
+# inside MySQL Router ("MySQL server has gone away"). Native password keeps
+# non-TLS clients working.
+default_authentication_plugin=mysql_native_password
+
+# Containers resolve peers over the compose bridge network; skip
+# reverse-DNS lookups of client IPs (all grants use @'%' anyway).
+skip_name_resolve
+
+# Load GR + Clone plugins at startup.
+#
+# CRITICAL: on first boot the official entrypoint runs `mysqld --initialize`,
+# which IGNORES plugin-load-add. Until the plugin loads, every
+# group_replication.* variable is unknown, so ALL group_replication options
+# (here and in node*.cnf) MUST keep their `loose-` prefix: mysqld then logs a
+# warning instead of aborting initialization with "unknown variable" and
+# leaving a half-initialized, unusable datadir behind.
+plugin_load_add='group_replication.so'
+plugin_load_add='mysql_clone.so'
+loose-group_replication_bootstrap_group=OFF
+loose-group_replication_start_on_boot=OFF
